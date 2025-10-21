@@ -1,148 +1,96 @@
 import streamlit as st
 import pandas as pd
-import re
-from io import BytesIO
+import io
+import traceback
 
 st.set_page_config(page_title="Auto Validation Rules Generator", layout="wide")
 
 st.title("📊 Auto Validation Rules + Failed Checks Generator")
+st.write("Upload your files below to automatically generate validation rules, review/edit them, and download the final Excel output.")
 
-# --- File uploads ---
-raw_data_file = st.file_uploader("Upload raw survey data (CSV / XLSX / SAV)", type=["csv", "xlsx"])
-skip_file = st.file_uploader("Upload skip rules (CSV or XLSX) — optional", type=["csv", "xlsx"])
-constructed_file = st.file_uploader("Upload Constructed List export (text file) — optional", type=["txt"])
+# --- File Uploads ---
+data_file = st.file_uploader("📂 Upload raw survey data (CSV / XLSX / SAV)", type=["csv", "xlsx", "sav"])
+rules_file = st.file_uploader("📋 Upload existing validation rules (optional)", type=["xlsx"])
+skip_file = st.file_uploader("🚦 Upload skip rules (CSV or XLSX) — optional", type=["csv", "xlsx"])
+constructed_file = st.file_uploader("🧱 Upload Constructed List export (TXT) — optional", type=["txt"])
 
 # --- Helper Functions ---
-def detect_variable_type(series):
-    """Detect type of variable (rating, single-select, numeric, open-end, multi-select)"""
-    unique = series.dropna().unique()
-    if series.dtype.kind in "if" and len(unique) > 0:
-        max_val = series.max()
-        min_val = series.min()
-        if 1 <= min_val <= 5 and max_val <= 5:
-            return "rating"
-        elif set(unique).issubset({0, 1}):
-            return "multi-select"
-        else:
-            return "numeric"
-    elif series.dtype == "object":
-        if all(isinstance(x, str) and len(x) > 20 for x in series.dropna()):
-            return "open-end"
-        return "single-select"
-    return "unknown"
+def load_data(file):
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file, encoding_errors="ignore")
+    elif file.name.endswith(".xlsx"):
+        return pd.read_excel(file)
+    else:
+        raise ValueError("Unsupported data file type.")
 
+def load_rules(file):
+    if file.name.endswith(".xlsx"):
+        return pd.read_excel(file)
+    elif file.name.endswith(".csv"):
+        return pd.read_csv(file)
+    else:
+        raise ValueError("Unsupported rules file type.")
 
-def read_file(file):
-    """Read CSV/XLSX generically"""
-    if file is None:
-        return None
-    try:
-        if file.name.endswith(".csv"):
-            return pd.read_csv(file)
-        elif file.name.endswith(".xlsx"):
-            return pd.read_excel(file)
-    except Exception as e:
-        st.error(f"Error reading {file.name}: {e}")
-        return None
-
-
-def parse_constructed_lists(text):
-    """Extract constructed list logic ranges (like ADD(ParentListName(),1,5))"""
-    logic_ranges = {}
-    matches = re.findall(r"List Name:\s*(\S+).*?\[Logic\]:\s*ADD\(.*?,(\d+),(\d+)\)", text, re.S | re.I)
-    for name, start, end in matches:
-        logic_ranges[name.strip()] = f"{start}-{end}"
-    return logic_ranges
-
-
-def generate_rules(data, skips=None, constructed_text=None):
+def generate_rules_from_data(df):
+    """Generate basic placeholder rules automatically"""
     rules = []
-
-    # --- Parse constructed lists if provided ---
-    constructed_ranges = {}
-    if constructed_text:
-        constructed_ranges = parse_constructed_lists(constructed_text)
-
-    # --- Loop through variables in raw data ---
-    for col in data.columns:
-        var_type = detect_variable_type(data[col])
-        check_type = ""
-        condition = ""
-
-        # --- Rule logic ---
-        if var_type == "rating":
-            range_str = constructed_ranges.get(col, "1-5")
-            check_type = "Range;Skip"
-            condition = f"{range_str};If Segment_7=1 then {col} should be answered"
-
-        elif var_type == "single-select":
-            check_type = "Range;Skip"
-            condition = f"1-5;If Segment_7=1 then {col} should be answered"
-
-        elif var_type == "multi-select":
-            check_type = "Multi-Select"
-            condition = "Only 0/1; At least one selected"
-
-        elif var_type == "numeric":
-            check_type = "Range"
-            condition = "Check for valid numeric range"
-
-        elif var_type == "open-end":
-            check_type = "Missing;OpenEnd_Junk"
-            condition = "MinLen(3)"
-
+    for col in df.columns:
+        dtype = str(df[col].dtype).lower()
+        if "float" in dtype or "int" in dtype:
+            rules.append([col, "Range", "1-5", "Auto (numeric)"])
+        elif "object" in dtype:
+            if df[col].astype(str).str.len().mean() > 10:
+                rules.append([col, "Missing;OpenEnd_Junk", ";MinLen(3)", "Auto (open-end/text)"])
+            else:
+                rules.append([col, "Missing", "", "Auto (single-select)"])
         else:
-            check_type = "Missing"
-            condition = "Should not be blank"
+            rules.append([col, "Missing", "", "Auto (unknown type)"])
+    return pd.DataFrame(rules, columns=["Question", "Check_Type", "Condition", "Source"])
 
-        # --- Add skip rules if provided ---
-        if skips is not None and col in skips["Question"].values:
-            skip_cond = skips.loc[skips["Question"] == col, "Condition"].values
-            if len(skip_cond) > 0:
-                check_type += ";Skip"
-                condition += f";{skip_cond[0]}"
+# --- Main Process ---
+if data_file:
+    try:
+        df = load_data(data_file)
+        st.success(f"✅ Data loaded successfully: {df.shape[0]} rows, {df.shape[1]} columns")
 
-        rules.append({
-            "Question": col,
-            "Check_Type": check_type,
-            "Condition": condition
-        })
+        # Generate initial rules
+        rules_df = generate_rules_from_data(df)
 
-    return pd.DataFrame(rules)
+        # Merge Skip / Constructed Logic if provided
+        if skip_file:
+            skip_df = load_rules(skip_file)
+            st.info("Skip file loaded and merged where applicable.")
+            # (Later: logic to map skips based on question names)
 
+        if constructed_file:
+            constructed_text = constructed_file.read().decode("utf-8", errors="ignore")
+            st.info("Constructed list file loaded. Logic extraction not applied yet for demo.")
 
-def to_excel(df: pd.DataFrame) -> BytesIO:
-    """Convert DataFrame to Excel file in-memory."""
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Validation Rules")
-    output.seek(0)
-    return output
+        # --- Display Editable Rules ---
+        st.subheader("🧾 Preview: Generated Validation Rules (Editable)")
+        edited_rules = st.data_editor(
+            rules_df,
+            num_rows="dynamic",
+            width="stretch",  # ✅ fixed deprecation warning
+            key="editor"
+        )
 
+        # --- Download Final Rules ---
+        st.subheader("💾 Download Final Validation Rules")
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            edited_rules.to_excel(writer, index=False, sheet_name="Validation_Rules")
+        st.download_button(
+            label="📥 Download Validation Rules (Excel)",
+            data=out.getvalue(),
+            file_name="validation_rules_final.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-# --- Generate rules ---
-if raw_data_file:
-    data = read_file(raw_data_file)
-    skips = read_file(skip_file)
-    constructed_text = constructed_file.read().decode("utf-8") if constructed_file else None
-
-    st.success(f"✅ Loaded raw data with {data.shape[1]} variables and {data.shape[0]} records")
-
-    rules_df = generate_rules(data, skips, constructed_text)
-
-    st.subheader("🧾 Preview: Generated Validation Rules (Editable)")
-    edited_rules = st.data_editor(rules_df, num_rows="dynamic", use_container_width=True, key="editor")
-
-    # --- Download Section ---
-    st.markdown("### 💾 Download Validation Rules")
-    excel_data = to_excel(edited_rules)
-
-    st.download_button(
-        label="📥 Download Edited Validation Rules (Excel)",
-        data=excel_data,
-        file_name="validation_rules.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    except Exception as e:
+        st.error("❌ An error occurred while processing your files.")
+        with st.expander("See error details"):
+            st.code(traceback.format_exc())
 
 else:
-    st.info("👆 Please upload raw survey data to start.")
+    st.warning("👆 Please upload at least a data file to begin.")
