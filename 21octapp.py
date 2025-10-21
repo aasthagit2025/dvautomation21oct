@@ -315,7 +315,11 @@ for col in df.columns:
 rules_df = pd.DataFrame(generated)
 
 # show rules (user can edit)
-edited = st.experimental_data_editor(rules_df, num_rows="dynamic", use_container_width=True)
+try:
+    edited = st.data_editor(rules_df, num_rows="dynamic", use_container_width=True)
+except AttributeError:
+    edited = st.experimental_data_editor(rules_df, num_rows="dynamic", use_container_width=True)
+
 
 st.markdown("### Preview / Run Validation")
 run = st.button("Run validation with current rules")
