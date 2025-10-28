@@ -6,20 +6,20 @@ import re
 import io
 from datetime import datetime
 
-st.set_page_config(page_title="DV Automation — Final Interactive", layout="wide")
-st.title("🔎 Full Data Validation Automation — Interactive Review Flow")
+st.set_page_config(page_title="KnowledgeExcel — Data Validation Automation (Final)", layout="wide")
+st.title("KnowledgeExcel — Data Validation Automation (Final)")
 
 st.markdown(
-    "Flow: Generate Validation Rules → Review (or Upload revised Validation Rules.xlsx) → Confirm → Generate Validation Report. "
-    "Two download buttons appear at the end: `Validation Rules.xlsx` and `Validation Report.xlsx`."
+    "Flow: Generate Validation Rules → Download & Review (optional) → Upload revised rules (optional) → Confirm → Generate Validation Report. "
+    "After generation, preview **Detailed Checks** and download both files (Rules + Report)."
 )
 
-# ---------------- Sidebar: uploads and controls ----------------
+# ---------------- Sidebar ----------------
 st.sidebar.header("Upload files")
 raw_file = st.sidebar.file_uploader("Raw Data (Excel or CSV)", type=["xlsx", "xls", "csv"])
 skips_file = st.sidebar.file_uploader("Sawtooth Skips (CSV/XLSX)", type=["csv", "xlsx"])
 rules_template_file = st.sidebar.file_uploader("Optional: Validation Rules template (xlsx)", type=["xlsx"])
-run_btn = st.sidebar.button("Run: Build Validation Rules 🚀")
+run_btn = st.sidebar.button("Run Full DV Automation: Build Validation Rules")
 
 st.sidebar.markdown("---")
 st.sidebar.header("Tuning parameters")
@@ -27,7 +27,7 @@ straightliner_threshold = st.sidebar.slider("Straightliner threshold", 0.50, 0.9
 junk_repeat_min = st.sidebar.slider("Junk OE: min repeated chars", 2, 8, 4, 1)
 junk_min_length = st.sidebar.slider("Junk OE: min OE length", 1, 10, 2, 1)
 
-# Check xlsxwriter availability
+# ---------------- xlsxwriter check ----------------
 try:
     import xlsxwriter  # noqa: F401
     XLSXWRITER_AVAILABLE = True
@@ -35,7 +35,7 @@ except Exception:
     XLSXWRITER_AVAILABLE = False
     st.sidebar.warning("xlsxwriter not installed — Excel formatting will be basic. Add 'xlsxwriter' to requirements.txt for full formatting.")
 
-# ---------------- Helper functions ----------------
+# ---------------- Helpers ----------------
 def read_any_df(uploaded):
     if uploaded is None:
         return None
@@ -45,7 +45,7 @@ def read_any_df(uploaded):
         if name.endswith((".xlsx", ".xls")):
             return pd.read_excel(uploaded, engine="openpyxl")
         else:
-            # use utf-8-sig to handle BOM
+            # BOM-safe
             return pd.read_csv(uploaded, encoding="utf-8-sig")
     except Exception:
         uploaded.seek(0)
@@ -92,8 +92,7 @@ def find_straightliners(df, candidate_cols, threshold=0.85):
             straightliners[idx] = {"value": topval, "same_count": int(same_count), "total": int(len(non_blank)), "fraction": float(frac)}
     return straightliners
 
-# Robust skip expression parser (supports AND/OR/parentheses/comparisons)
-# Tokenize/parse approach (keeps previous robust parser)
+# Re-usable robust skip parser (tokenize/parse) — same as prior stable parser
 token_spec = [
     ('LPAREN',  r'\('), ('RPAREN',  r'\)'),
     ('AND',     r'\bAND\b|\band\b'), ('OR', r'\bOR\b|\bor\b'),
@@ -218,7 +217,8 @@ def parse_skip_expression_to_mask(expr, df):
             m = re.match(r'^\s*([A-Za-z0-9_\.]+)\s*(=|==|<>|!=|>|<|>=|<=)\s*(.+)\s*$', expr)
             if m:
                 var, op, val = m.group(1).strip(), m.group(2).strip(), m.group(3).strip().strip("'\"")
-                if var not in df.columns: return pd.Series(False, index=df.index)
+                if var not in df.columns:
+                    return pd.Series(False, index=df.index)
                 left = df[var].astype(str).str.strip()
                 try:
                     valnum = float(val); coerced = pd.to_numeric(left, errors='coerce')
@@ -236,14 +236,21 @@ def parse_skip_expression_to_mask(expr, df):
         except Exception:
             return pd.Series(False, index=df.index)
 
-# ---------------- MAIN RUN FLOW ----------------
-if st.session_state.get("confirmed_report_ready") is None:
-    st.session_state["confirmed_report_ready"] = False
+# ---------------- SessionState holders for buffers ----------------
+if "rules_buf" not in st.session_state:
+    st.session_state["rules_buf"] = None
+if "report_buf" not in st.session_state:
+    st.session_state["report_buf"] = None
+if "final_vr_df" not in st.session_state:
+    st.session_state["final_vr_df"] = None
+if "detailed_df_preview" not in st.session_state:
+    st.session_state["detailed_df_preview"] = None
 
+# ---------------- Main actions ----------------
 if run_btn:
-    # 1) validate uploads present
+    # Validate uploads
     if raw_file is None or skips_file is None:
-        st.error("Please upload raw data and Sawtooth skips files before running.")
+        st.error("Please upload Raw Data and Sawtooth Skips files.")
     else:
         progress = st.progress(0)
         status = st.empty()
@@ -258,19 +265,17 @@ if run_btn:
                 rules_wb = None
         progress.progress(10)
 
-        # 2) detect respondent id and remove BOM if any
-        status.text("Detecting Respondent ID and filtering system vars...")
+        # respondent id detection & remove BOM
+        status.text("Detecting Respondent ID and excluding sys_ variables")
         possible_ids = ["RESPID","RespondentID","CaseID","caseid","id","ID","Respondent Id","sys_RespNum"]
         id_col = next((c for c in raw_df.columns if c in possible_ids), raw_df.columns[0])
         id_col = id_col.lstrip("\ufeff")
-        # Filter out sys_ variables from working sets
         data_vars = [c for c in raw_df.columns if not str(c).lower().startswith("sys_")]
         progress.progress(20)
 
-        # 3) build Validation Rules from skips (excluding sys_ vars)
-        status.text("Building Validation Rules from Sawtooth skips...")
+        # Build validation rules from skips (exclude sys_ vars)
+        status.text("Generating Validation Rules from Sawtooth Skips...")
         validation_rules = []
-        # heuristics for skip columns
         skips_lc = {c.lower(): c for c in skips_df.columns}
         logic_col = next((skips_lc[c] for c in skips_lc if 'logic' in c or 'condition' in c), None)
         from_col = next((skips_lc[c] for c in skips_lc if 'skip from' in c or c == 'from' or 'question' in c), None)
@@ -282,7 +287,6 @@ if run_btn:
                 src = r.get(from_col, "") if from_col else ""
                 tgt = r.get(to_col, "") if to_col else ""
                 if pd.notna(logic) and str(logic).strip() != "":
-                    # only create validation rule if src is not a sys_ var
                     src_str = str(src) if pd.notna(src) else ""
                     if not src_str.lower().startswith("sys_"):
                         validation_rules.append({
@@ -292,11 +296,12 @@ if run_btn:
                             "Description": f"Skip {src_str} when {str(logic).strip()} (Target: {tgt})",
                             "Derived From": "Sawtooth Skip"
                         })
-        progress.progress(40)
+        progress.progress(45)
 
-        # 4) auto-derived rules (Range, DK) for non-sys variables
+        # Add auto rules (Range and DK) for non-sys variables
         status.text("Adding auto rules (Range, DK) for non-system variables...")
-        DK_CODES = [88, 99]; DK_STRINGS = ["DK","Refused","Don't know","Dont know","Refuse","REFUSED"]
+        DK_CODES = [88, 99]
+        DK_STRINGS = ["DK", "Refused", "Don't know", "Dont know", "Refuse", "REFUSED"]
         numeric_min, numeric_max = 0, 99
         for var in data_vars:
             validation_rules.append({
@@ -313,10 +318,10 @@ if run_btn:
                 "Description": "Auto DK/Refused detection",
                 "Derived From": "Auto"
             })
-        progress.progress(60)
+        progress.progress(65)
 
-        # 5) if user provided a rules template, append (but still exclude sys_ vars)
-        status.text("Ingesting manual rules if provided...")
+        # Ingest manual rules template if provided (exclude sys_)
+        status.text("Ingesting manual rules (optional)...")
         applied_manual = []
         if rules_wb and isinstance(rules_wb, dict):
             for sheetname, df in rules_wb.items():
@@ -338,9 +343,9 @@ if run_btn:
                                 "Description": f"Manual rule from template {sheetname}",
                                 "Derived From": f"Rules Template: {sheetname}"
                             })
-        progress.progress(75)
+        progress.progress(80)
 
-        # Build Validation Rules dataframe for preview (preserve data_vars order)
+        # Build final preview VR dataframe (preserve data_vars order)
         status.text("Preparing Validation Rules preview...")
         vr_df = pd.DataFrame(validation_rules)
         if vr_df.empty:
@@ -358,81 +363,115 @@ if run_btn:
                 if col not in vr_df.columns:
                     vr_df[col] = ""
             vr_df = vr_df[["Variable","Type","Rule Applied","Description","Derived From"]]
-        st.subheader("Validation Rules — Preview (system variables excluded)")
-        st.dataframe(vr_df, use_container_width=True)
-        progress.progress(85)
 
-        # Offer the user option to upload a revised Validation Rules.xlsx or confirm generated rules
-        status.text("Review validation rules. You may upload a revised Validation Rules.xlsx (optional) or Confirm to generate the report.")
-        uploaded_rules_override = st.file_uploader("Upload revised Validation Rules.xlsx (optional) — will be used instead of generated rules", type=["xlsx"])
-        col1, col2 = st.columns(2)
-        with col1:
-            confirm_btn = st.button("✅ Confirm & Generate Validation Report")
-        with col2:
-            edit_btn = st.button("🔁 Re-run rule generation (discard preview and regenerate)")
+        # Store generated rules in session (as bytes) and present download immediately
+        status.text("Saving generated Validation Rules and preparing download...")
+        rules_buf = io.BytesIO()
+        try:
+            engine_choice = "xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl"
+            with pd.ExcelWriter(rules_buf, engine=engine_choice) as writer:
+                vr_df.to_excel(writer, sheet_name="Validation_Rules", index=False)
+                if XLSXWRITER_AVAILABLE:
+                    workbook = writer.book
+                    worksheet = writer.sheets["Validation_Rules"]
+                    header_format = workbook.add_format({'bold': True, 'bg_color': '#305496', 'font_color': 'white', 'border':1})
+                    for col_num, value in enumerate(vr_df.columns.values):
+                        worksheet.write(0, col_num, value, header_format)
+                    worksheet.freeze_panes(1,1)
+                    for i, col in enumerate(vr_df.columns):
+                        try:
+                            width = max(vr_df[col].astype(str).map(len).max(), len(str(col))) + 2
+                            worksheet.set_column(i, i, min(60, width))
+                        except Exception:
+                            pass
+            rules_buf.seek(0)
+            st.session_state["rules_buf"] = rules_buf.getvalue()
+            st.session_state["final_vr_df"] = vr_df.copy()
+            # immediate download button for generated rules (user can review offline)
+            st.subheader("Validation Rules — Preview")
+            st.dataframe(vr_df, use_container_width=True)
+            st.download_button("📥 Download Validation Rules.xlsx (Generated)", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error("Could not prepare Validation Rules download: " + str(e))
+            st.session_state["rules_buf"] = None
+        progress.progress(95)
 
-        # If user uploaded revised rules, read them into vr_df_override
-        vr_df_override = None
+        # Offer upload of revised rules and Confirm button
+        st.markdown("**Optional:** Upload revised `Validation Rules.xlsx` (to replace generated rules), then click **Confirm & Generate Validation Report**.")
+        uploaded_rules_override = st.file_uploader("Upload revised Validation Rules.xlsx (optional)", type=["xlsx"])
+        confirm_btn = st.button("✅ Confirm & Generate Validation Report")
+        progress.progress(100)
+
+        # If an override file is uploaded, replace session rules buffer and dataframe
         if uploaded_rules_override is not None:
             try:
-                vr_df_override = pd.read_excel(uploaded_rules_override, sheet_name=0)
-                # Ensure required columns present
+                vr_override_df = pd.read_excel(uploaded_rules_override, sheet_name=0)
                 expected_cols = ["Variable","Type","Rule Applied","Description","Derived From"]
-                for c in expected_cols:
-                    if c not in vr_df_override.columns:
-                        st.warning(f"Uploaded rules missing column: {c}. The generated preview will be used instead.")
-                        vr_df_override = None
-                        break
-                if vr_df_override is not None:
-                    # filter out sys_ vars if any in uploaded
-                    vr_df_override = vr_df_override[~vr_df_override['Variable'].astype(str).str.lower().str.startswith("sys_")]
-                    st.success("Uploaded validation rules loaded and will be used when you Confirm.")
+                if not all(c in vr_override_df.columns for c in expected_cols):
+                    st.error(f"Uploaded rules missing required columns. Expected: {expected_cols}")
+                else:
+                    # filter out sys_ variables
+                    vr_override_df = vr_override_df[~vr_override_df['Variable'].astype(str).str.lower().str.startswith("sys_")].reset_index(drop=True)
+                    # store as bytes and dataframe
+                    buf_override = io.BytesIO()
+                    try:
+                        with pd.ExcelWriter(buf_override, engine="xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl") as writer:
+                            vr_override_df.to_excel(writer, sheet_name="Validation_Rules", index=False)
+                            if XLSXWRITER_AVAILABLE:
+                                workbook = writer.book
+                                worksheet = writer.sheets["Validation_Rules"]
+                                header_format = workbook.add_format({'bold': True, 'bg_color': '#305496', 'font_color': 'white', 'border':1})
+                                for col_num, value in enumerate(vr_override_df.columns.values):
+                                    worksheet.write(0, col_num, value, header_format)
+                                worksheet.freeze_panes(1,1)
+                        buf_override.seek(0)
+                        st.session_state["rules_buf"] = buf_override.getvalue()
+                        st.session_state["final_vr_df"] = vr_override_df.copy()
+                        st.success("Uploaded Validation Rules will be used when you Confirm.")
+                        st.download_button("📥 Download Uploaded Validation Rules.xlsx", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    except Exception as e:
+                        st.error("Could not process uploaded validation rules: " + str(e))
             except Exception as e:
-                st.error("Could not read uploaded Validation Rules.xlsx — please check format. Error: " + str(e))
-                vr_df_override = None
+                st.error("Could not read uploaded Validation Rules.xlsx. Error: " + str(e))
 
-        progress.progress(90)
+# ---------------- Confirm action (generate report) ----------------
+if st.button("Generate Report from confirmed rules (shortcut)"):
+    # provide a shortcut: if rules already prepared and user wants to directly generate (useful in repeated runs)
+    if st.session_state.get("final_vr_df") is None:
+        st.error("No validation rules found in session. Run the 'Run Full DV Automation' first to generate rules.")
+    else:
+        # set a flag to reuse confirm flow below
+        st.session_state["_force_confirm"] = True
 
-        # If "Re-run rule generation" clicked: redo (simple approach: reload run by setting a message)
-        if edit_btn:
-            st.info("Re-running rule generation. Press the main 'Run: Build Validation Rules' button again after adjusting inputs if needed.")
-            progress.progress(0)
-        # If confirm clicked, proceed to generate Validation Report using uploaded rules if provided otherwise generated preview
-        if confirm_btn:
-            final_vr_df = vr_df_override.copy() if vr_df_override is not None else vr_df.copy()
-            # Ensure sys_ not present
-            final_vr_df = final_vr_df[~final_vr_df['Variable'].astype(str).str.lower().str.startswith("sys_")].reset_index(drop=True)
+# The actual report generation triggered by either confirm_btn or force flag
+if ('_force_confirm' in st.session_state and st.session_state.get("_force_confirm")) or ( 'final_vr_df' in st.session_state and st.session_state["final_vr_df"] is not None and st.button("Confirm & Generate Validation Report (use this after uploading rules)")):
+    # Use final_vr_df from session
+    final_vr_df = st.session_state.get("final_vr_df")
+    if final_vr_df is None:
+        st.error("No Validation Rules available to build report.")
+    else:
+        # Load raw data again (if not loaded in this run, ask to rerun)
+        if raw_file is None or skips_file is None:
+            st.error("Raw data or skips file not found in this session. Please run 'Run Full DV Automation' again.")
+        else:
+            # read raw_df again (safe)
+            raw_df = read_any_df(raw_file)
+            data_vars = [c for c in raw_df.columns if not str(c).lower().startswith("sys_")]
+            id_candidates = ["RESPID","RespondentID","CaseID","caseid","id","ID","Respondent Id","sys_RespNum"]
+            id_col = next((c for c in raw_df.columns if c in id_candidates), raw_df.columns[0])
+            id_col = id_col.lstrip("\ufeff")
+            status = st.empty()
+            progress = st.progress(0)
+            status.text("Running validation checks using confirmed rules...")
+            progress.progress(10)
 
-            # Save the final rules to an in-memory Excel for download later
-            rules_buf = io.BytesIO()
-            try:
-                engine_choice = "xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl"
-                with pd.ExcelWriter(rules_buf, engine=engine_choice) as writer:
-                    final_vr_df.to_excel(writer, sheet_name="Validation_Rules", index=False)
-                    if XLSXWRITER_AVAILABLE:
-                        workbook = writer.book
-                        worksheet = writer.sheets["Validation_Rules"]
-                        header_format = workbook.add_format({'bold': True, 'bg_color': '#305496', 'font_color': 'white', 'border':1})
-                        for col_num, value in enumerate(final_vr_df.columns.values):
-                            worksheet.write(0, col_num, value, header_format)
-                        worksheet.freeze_panes(1,1)
-                        for i, col in enumerate(final_vr_df.columns):
-                            try:
-                                width = max(final_vr_df[col].astype(str).map(len).max(), len(str(col))) + 2
-                                worksheet.set_column(i, i, min(60, width))
-                            except Exception:
-                                pass
-                rules_buf.seek(0)
-            except Exception as e:
-                st.error("Could not prepare Validation Rules download: " + str(e))
-                rules_buf = None
+            DK_CODES = [88, 99]
+            DK_STRINGS = ["DK", "Refused", "Don't know", "Dont know", "Refuse", "REFUSED"]
+            numeric_min, numeric_max = 0, 99
 
-            # Now run checks using final_vr_df and raw_df (excluding sys_ vars)
-            status.text("Running full validation checks using confirmed rules...")
             detailed_findings = []
             data_df = raw_df.copy()
 
-            # Helper for collecting respondent IDs (limit to 200 IDs in list to keep file sizes reasonable)
             def format_ids(ids_series, max_ids=200):
                 return ";".join(map(str, ids_series.astype(str).unique()[:max_ids].tolist()))
 
@@ -446,13 +485,13 @@ if run_btn:
                     "Affected_Count": int(dup_mask.sum()),
                     "Respondent_IDs": format_ids(data_df.loc[dup_mask, id_col])
                 })
+            progress.progress(25)
 
-            # Apply each rule from final_vr_df
+            # Iterate rules
             for _, rule in final_vr_df.iterrows():
                 var = str(rule['Variable'])
                 rtype = str(rule['Type']).strip().lower()
                 r_applied = str(rule['Rule Applied'])
-                # skip if var not in data (or is sys_)
                 if var not in data_df.columns:
                     continue
                 # Range
@@ -473,7 +512,6 @@ if run_btn:
                         })
                 # Skip
                 elif 'skip' in rtype:
-                    # parse expression and build boolean mask where skip applies
                     try:
                         mask = parse_skip_expression_to_mask(r_applied, data_df)
                         violators = data_df[mask & data_df[var].notna()]
@@ -486,7 +524,6 @@ if run_btn:
                                 "Respondent_IDs": format_ids(violators[id_col])
                             })
                     except Exception as e:
-                        # Skip parsing errors
                         detailed_findings.append({
                             "Variable": var,
                             "Check_Type": "Skip Parsing Error",
@@ -520,7 +557,7 @@ if run_btn:
                             "Respondent_IDs": format_ids(data_df.loc[mask, id_col])
                         })
                 else:
-                    # generic fallback checks: range-like numeric check and DK tokens
+                    # fallback: check DK tokens and numeric range
                     try:
                         coerced = pd.to_numeric(data_df[var], errors='coerce')
                         mask_num_out = (~coerced.isna()) & (~coerced.isin(DK_CODES)) & ((coerced < numeric_min) | (coerced > numeric_max))
@@ -534,31 +571,31 @@ if run_btn:
                             })
                     except Exception:
                         pass
+            progress.progress(70)
 
-            # Straightliner detection across prefix groups (only non-sys vars)
+            # Straightliner detection on data_vars
             prefixes = {}
             for v in data_vars:
                 p = re.split(r'[_\.]', v)[0]
                 prefixes.setdefault(p, []).append(v)
-            total_straight_flags = {}
+            straight_flags = {}
             for prefix, cols in prefixes.items():
                 if len(cols) >= 3:
                     sliners = find_straightliners(data_df, cols, threshold=straightliner_threshold)
                     if sliners:
-                        idxs = list(sliners.keys())
                         detailed_findings.append({
                             "Variable": prefix,
                             "Check_Type": "Straightliner (Grid)",
                             "Description": f"{len(sliners)} respondents flagged as straightliners across {len(cols)} items",
                             "Affected_Count": int(len(sliners)),
-                            "Respondent_IDs": format_ids(pd.Series(idxs))
+                            "Respondent_IDs": format_ids(pd.Series(list(sliners.keys())))
                         })
-                        for i in idxs:
-                            total_straight_flags[i] = 1
-            progress.progress(98)
+                        for idx in sliners.keys():
+                            straight_flags[idx] = 1
+            progress.progress(90)
 
-            # Build final DataFrames for export
-            detailed_df = pd.DataFrame(detailed_findings) if len(detailed_findings) > 0 else pd.DataFrame(columns=["Variable","Check_Type","Description","Affected_Count","Respondent_IDs"])
+            # Build final dataframes
+            detailed_df = pd.DataFrame(detailed_findings) if detailed_findings else pd.DataFrame(columns=["Variable","Check_Type","Description","Affected_Count","Respondent_IDs"])
             summary_df = detailed_df.groupby("Check_Type", as_index=False)["Affected_Count"].sum().sort_values("Affected_Count", ascending=False) if not detailed_df.empty else pd.DataFrame(columns=["Check_Type","Affected_Count"])
             project_info = pd.DataFrame({
                 "Report Generated":[datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")],
@@ -568,25 +605,28 @@ if run_btn:
                 "Variables Validated":[len(data_vars)]
             })
 
-            # Prepare Validation Report.xlsx (with Respondent_IDs in Detailed Checks)
+            # Persist final vr_df as Excel bytes (rules_buf already in session from earlier; update if final_vr_df different)
+            if st.session_state.get("rules_buf") is None:
+                try:
+                    buf_r = io.BytesIO()
+                    with pd.ExcelWriter(buf_r, engine="xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl") as writer:
+                        final_vr_df.to_excel(writer, sheet_name="Validation_Rules", index=False)
+                    buf_r.seek(0); st.session_state["rules_buf"] = buf_r.getvalue()
+                except Exception:
+                    st.warning("Could not persist Validation Rules buffer for download.")
+
+            # Create report_buf and persist
             report_buf = io.BytesIO()
             try:
-                engine_choice = "xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl"
-                with pd.ExcelWriter(report_buf, engine=engine_choice) as writer:
+                with pd.ExcelWriter(report_buf, engine="xlsxwriter" if XLSXWRITER_AVAILABLE else "openpyxl") as writer:
                     detailed_df.to_excel(writer, sheet_name="Detailed Checks", index=False)
                     summary_df.to_excel(writer, sheet_name="Summary", index=False)
                     final_vr_df.to_excel(writer, sheet_name="Validation_Rules", index=False)
                     project_info.to_excel(writer, sheet_name="Project Info", index=False)
-
                     if XLSXWRITER_AVAILABLE:
                         workbook = writer.book
                         header_fmt = workbook.add_format({'bold': True, 'bg_color': '#305496', 'font_color': 'white', 'border':1})
-                        sheet_map = {
-                            "Detailed Checks": detailed_df,
-                            "Summary": summary_df,
-                            "Validation_Rules": final_vr_df,
-                            "Project Info": project_info
-                        }
+                        sheet_map = {"Detailed Checks": detailed_df, "Summary": summary_df, "Validation_Rules": final_vr_df, "Project Info": project_info}
                         for sheet_name, df_sheet in sheet_map.items():
                             try:
                                 ws = writer.sheets[sheet_name]
@@ -602,22 +642,34 @@ if run_btn:
                             except Exception:
                                 pass
                 report_buf.seek(0)
+                st.session_state["report_buf"] = report_buf.getvalue()
+                st.session_state["detailed_df_preview"] = detailed_df.copy()
             except Exception as e:
                 st.error("Could not prepare Validation Report for download: " + str(e))
-                report_buf = None
+                st.session_state["report_buf"] = None
 
-            # At this point both rules_buf and report_buf exist (if no errors). Show two download buttons
-            st.success("Validation finished. Download the final files below.")
-            if rules_buf is not None:
-                st.download_button("📥 Download Validation Rules.xlsx", data=rules_buf, file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                st.error("Validation Rules file not available.")
-
-            if report_buf is not None:
-                st.download_button("📥 Download Validation Report.xlsx", data=report_buf, file_name="Validation Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                st.error("Validation Report file not available.")
-
-            # mark session state to indicate report ready (useful if you want to show the same again without re-run)
-            st.session_state["confirmed_report_ready"] = True
             progress.progress(100)
+            status.success("Validation Report generated. Preview and download below.")
+
+# ---------------- Display preview and persistent download buttons if buffers exist ----------------
+if st.session_state.get("detailed_df_preview") is not None:
+    st.subheader("Detailed Checks — Preview")
+    # show only first 200 rows to keep UI responsive
+    try:
+        st.dataframe(st.session_state["detailed_df_preview"].head(200), use_container_width=True)
+    except Exception:
+        st.write(st.session_state["detailed_df_preview"].head(200))
+
+    cols = st.columns(2)
+    with cols[0]:
+        if st.session_state.get("rules_buf") is not None:
+            st.download_button("📥 Download Validation Rules.xlsx", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("Validation Rules file not available for download.")
+    with cols[1]:
+        if st.session_state.get("report_buf") is not None:
+            st.download_button("📥 Download Validation Report.xlsx", data=io.BytesIO(st.session_state["report_buf"]), file_name="Validation Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("Validation Report file not available for download yet.")
+
+# EOF
