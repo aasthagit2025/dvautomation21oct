@@ -648,41 +648,42 @@ if st.session_state.get("_force_generate"):
                         "Respondent_IDs": format_ids(data_df.loc[mask_out, id_col])
                     })
             # Skip
-            elif 'skip' in rtype:
-                try:
-                    # parse mask; raise on parse failure
-                    mask = parse_skip_expression_to_mask(r_applied, data_df)
-                    # Violation Type 1: Condition True but answered (should be blank)
-                    violators_answered = data_df[mask & data_df[var].notna() & (data_df[var].astype(str).str.strip()!='')]
-                    # Violation Type 2: Condition False but blank (should be answered)
-                    violators_skipped = data_df[(~mask) & (data_df[var].isna() | (data_df[var].astype(str).str.strip() == ''))]
+elif 'skip' in rtype:
+    try:
+        mask = parse_skip_expression_to_mask(r_applied, data_df).astype(bool)
+        ans_series = data_df[var].astype(str).str.strip()
+        blank_mask = ans_series.isna() | ans_series.eq('') |   ans_series.str.lower().isin(['na','n/a','nan','none'])
+        # Violation 1: should skip but answered
+        violators_answered = data_df[mask & ~blank_mask]
+        # Violation 2: should answer but skipped
+        violators_skipped = data_df[(~mask) & blank_mask]
 
-                    if len(violators_answered) > 0:
-                        detailed_findings.append({
-                            "Variable": var,
-                            "Check_Type": "Skip Violation (Answered when should Skip)",
-                            "Description": f"{len(violators_answered)} respondents answered {var} though skip condition '{r_applied}' applies",
-                            "Affected_Count": int(len(violators_answered)),
-                            "Respondent_IDs": format_ids(violators_answered[id_col])
-                        })
+        if len(violators_answered) > 0:
+            detailed_findings.append({
+                "Variable": var,
+                "Check_Type": "Skip Violation (Answered when should Skip)",
+                "Description": f"{len(violators_answered)} respondents answered {var} though skip condition '{r_applied}' applies",
+                "Affected_Count": int(len(violators_answered)),
+                "Respondent_IDs": format_ids(violators_answered[id_col])
+            })
 
-                    if len(violators_skipped) > 0:
-                        detailed_findings.append({
-                            "Variable": var,
-                            "Check_Type": "Skip Violation (Skipped when should Answer)",
-                            "Description": f"{len(violators_skipped)} respondents skipped {var} though skip condition '{r_applied}' was False",
-                            "Affected_Count": int(len(violators_skipped)),
-                            "Respondent_IDs": format_ids(violators_skipped[id_col])
-                        })
-                except Exception as e:
-                    # Log skip parsing error in report
-                    detailed_findings.append({
-                        "Variable": var,
-                        "Check_Type": "Skip Parsing Error",
-                        "Description": f"Could not parse skip rule: {r_applied}. Error: {e}",
-                        "Affected_Count": 0,
-                        "Respondent_IDs": ""
-                    })
+        if len(violators_skipped) > 0:
+            detailed_findings.append({
+                "Variable": var,
+                "Check_Type": "Skip Violation (Skipped when should Answer)",
+                "Description": f"{len(violators_skipped)} respondents skipped {var} though skip condition '{r_applied}' was False",
+                "Affected_Count": int(len(violators_skipped)),
+                "Respondent_IDs": format_ids(violators_skipped[id_col])
+            })
+    except Exception as e:
+        detailed_findings.append({
+            "Variable": var,
+            "Check_Type": "Skip Parsing Error",
+            "Description": f"Could not parse skip rule: {r_applied}. Error: {e}",
+            "Affected_Count": 0,
+            "Respondent_IDs": ""
+        })
+            
             # DK/Refused
             elif 'dk' in rtype or 'ref' in rtype:
                 s = data_df[var].astype(str)
