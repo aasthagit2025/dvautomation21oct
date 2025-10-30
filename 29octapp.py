@@ -1,9 +1,14 @@
-# 29octapp.py
+from pathlib import Path
+content = r'''# 29octapp.py
 """
-Final Data Validation Streamlit App
-- Next Question only skip auto-adjust (uses raw data sequence)
-- DK/Refused persisted in session_state to avoid NameError
-- Multi-select completeness, Range, DK, Junk OE, Straightliner checks
+Final Data Validation Streamlit App (Updated with robust skip parser and two-way skip validation)
+- Supports: <>, =, AND/OR, NOT(...), parentheses, multi-variable expressions
+- "Next Question only" skip auto-adjust (uses raw data sequence)
+- Two-way skip validation:
+    * Answered when should skip
+    * Skipped when should answer
+- DK_CODES persisted in session_state to avoid NameError
+- Multi-select completeness, Range, DK/Refused, Junk OE, Straightliner checks
 - Validation Rules and Validation Report downloads
 """
 
@@ -140,34 +145,6 @@ def find_straightliners(df, candidate_cols, threshold=0.85):
             straightliners[idx] = {"value": topval, "same_count": int(same_count), "total": int(len(non_blank)), "fraction": float(frac)}
     return straightliners
 
-# parse simple skip expressions into boolean mask (safe eval fallback)
-def parse_skip_expression_to_mask(expr, df):
-    """
-    Safely parse skip expressions like
-    'OMQ2_r1<>1 OR OMQ2_r2=1 AND OMQ3<>99'
-    Supports <> (→!=), = (→==), AND/OR and multi-variable conditions.
-    Logs parsing errors gracefully.
-    """
-    try:
-        expr2 = str(expr)
-        # Replace SQL-like operators with Python equivalents
-        expr2 = expr2.replace("<>", "!=")
-        # Replace lone '=' with '==' (but not inside !=)
-        expr2 = re.sub(r'(?<![!<>=])=(?!=)', '==', expr2)
-        # Replace logical words with Python operators
-        expr2 = re.sub(r'\bAND\b', '&', expr2, flags=re.IGNORECASE)
-        expr2 = re.sub(r'\bOR\b', '|', expr2, flags=re.IGNORECASE)
-        # Replace variable names with dataframe references
-        for col in df.columns:
-            expr2 = re.sub(rf'\b{re.escape(col)}\b', f"df[{repr(col)}]", expr2)
-        mask = eval(expr2, {"df": df, "np": np, "pd": pd})
-        return mask.fillna(False).astype(bool)
-    except Exception as e:
-        # Return all False mask, app logs in Validation Report
-        st.warning(f"Skip Parsing Error for expression '{expr}': {e}")
-        return pd.Series(False, index=df.index)
-
-
 def group_variables(vars_list: List[str]) -> dict:
     groups = {}
     for v in vars_list:
@@ -209,6 +186,50 @@ def detect_variable_type_and_stats(series: pd.Series) -> Tuple[str, dict]:
     if numeric_prop >= 0.6 and avg_len < 15:
         return "Numeric", stats
     return "Categorical", stats
+
+# ---------------- robust skip parser ----------------
+def parse_skip_expression_to_mask(expr, df):
+    """
+    Safely parse skip expressions like:
+      'OMQ2_r1<>1 OR OMQ2_r2=1 AND OMQ3<>99'
+      'Not(PCQ5x1_r1=1 Or PCQ5x1_r1=2 Or PCQ5x1_r1=3)'
+    Supports <> -> !=, = -> ==, AND/OR, NOT(), parentheses, multi-variable expressions.
+    Returns a boolean Series or raises an Exception on parse failure.
+    """
+    expr_orig = str(expr)
+    try:
+        expr2 = str(expr_orig)
+
+        # Normalize common tokens
+        # Handle NOT(...) or Not(...) -> convert to Python ~(...)
+        expr2 = re.sub(r'\bNot\s*\(', ' ~(', expr2, flags=re.IGNORECASE)
+        # Replace SQL-like operators with Python equivalents
+        expr2 = expr2.replace("<>", "!=")
+        # Replace lone '=' with '==' unless part of !=, <=, >=
+        expr2 = re.sub(r'(?<![!<>=])=(?!=)', '==', expr2)
+        # Logical words to python bitwise operators for pandas Series
+        expr2 = re.sub(r'\bAND\b', '&', expr2, flags=re.IGNORECASE)
+        expr2 = re.sub(r'\bOR\b', '|', expr2, flags=re.IGNORECASE)
+
+        # Replace variable tokens with df['col'] reference, careful with names that may contain special chars
+        cols = list(df.columns)
+        # Sort by length descending to avoid partial replacements
+        cols_sorted = sorted(cols, key=lambda x: -len(x))
+        for col in cols_sorted:
+            # only replace whole-word occurrences
+            expr2 = re.sub(rf'(?<!\w){re.escape(col)}(?!\w)', f"df[{repr(col)}]", expr2)
+
+        # Evaluate safely in a restricted namespace
+        mask = eval(expr2, {"df": df, "np": np, "pd": pd})
+        # Ensure result is boolean Series
+        if isinstance(mask, (pd.Series, np.ndarray, list)):
+            mask_ser = pd.Series(mask, index=df.index)
+            return mask_ser.fillna(False).astype(bool)
+        else:
+            raise ValueError(f"Parsed expression did not return a boolean Series: {expr2}")
+    except Exception as e:
+        # Re-raise the exception so caller can log Skip Parsing Error in report
+        raise ValueError(f"Skip parse failed for '{expr_orig}': {e}")
 
 # ---------------- session storage ----------------
 if "rules_buf" not in st.session_state:
@@ -258,7 +279,6 @@ if run_btn:
         # Build rules from skips (Skips.csv expected format)
         validation_rules = []
         # normalize column names for skips file to known names
-        # we'll look for known headers (case-insensitive): Skip From, Skip Type, Skip To, Logic, Comment
         skips_cols = {c.strip().lower(): c for c in skips_df.columns}
         # map columns
         skip_from_col = skips_cols.get("skip from") or skips_cols.get("question") or skips_cols.get("from") or list(skips_df.columns)[0]
@@ -618,7 +638,6 @@ if st.session_state.get("_force_generate"):
                 if m:
                     lo, hi = int(m.group(1)), int(m.group(2))
                 coerced = pd.to_numeric(data_df[var], errors='coerce')
-                # Use DK_CODES from session_state already loaded above
                 mask_out = (~coerced.isna()) & (~coerced.isin(DK_CODES)) & ((coerced < lo) | (coerced > hi))
                 if mask_out.sum() > 0:
                     detailed_findings.append({
@@ -631,17 +650,32 @@ if st.session_state.get("_force_generate"):
             # Skip
             elif 'skip' in rtype:
                 try:
+                    # parse mask; raise on parse failure
                     mask = parse_skip_expression_to_mask(r_applied, data_df)
-                    violators = data_df[mask & data_df[var].notna() & (data_df[var].astype(str).str.strip()!='')]
-                    if len(violators) > 0:
+                    # Violation Type 1: Condition True but answered (should be blank)
+                    violators_answered = data_df[mask & data_df[var].notna() & (data_df[var].astype(str).str.strip()!='')]
+                    # Violation Type 2: Condition False but blank (should be answered)
+                    violators_skipped = data_df[(~mask) & (data_df[var].isna() | (data_df[var].astype(str).str.strip() == ''))]
+
+                    if len(violators_answered) > 0:
                         detailed_findings.append({
                             "Variable": var,
-                            "Check_Type": "Skip Violation",
-                            "Description": f"{len(violators)} respondents answered {var} though skip ({r_applied}) applies",
-                            "Affected_Count": int(len(violators)),
-                            "Respondent_IDs": format_ids(violators[id_col])
+                            "Check_Type": "Skip Violation (Answered when should Skip)",
+                            "Description": f"{len(violators_answered)} respondents answered {var} though skip condition '{r_applied}' applies",
+                            "Affected_Count": int(len(violators_answered)),
+                            "Respondent_IDs": format_ids(violators_answered[id_col])
+                        })
+
+                    if len(violators_skipped) > 0:
+                        detailed_findings.append({
+                            "Variable": var,
+                            "Check_Type": "Skip Violation (Skipped when should Answer)",
+                            "Description": f"{len(violators_skipped)} respondents skipped {var} though skip condition '{r_applied}' was False",
+                            "Affected_Count": int(len(violators_skipped)),
+                            "Respondent_IDs": format_ids(violators_skipped[id_col])
                         })
                 except Exception as e:
+                    # Log skip parsing error in report
                     detailed_findings.append({
                         "Variable": var,
                         "Check_Type": "Skip Parsing Error",
@@ -742,6 +776,9 @@ if st.session_state.get("_force_generate"):
                             for i, col in enumerate(df_sheet.columns):
                                 try:
                                     width = max(df_sheet[col].astype(str).map(len).max(), len(str(col))) + 2
+                                except Exception:
+                                    width = len(str(col)) + 2
+                                try:
                                     ws.set_column(i, i, min(80, width))
                                 except Exception:
                                     pass
@@ -765,7 +802,7 @@ if st.session_state.get("detailed_df_preview") is not None:
     cols = st.columns(2)
     with cols[0]:
         if st.session_state.get("rules_buf") is not None:
-            st.download_button("📥 Download Validation Rules.xlsx", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("📥 Download Validation Rules.xlsx", data=io.BytesIO(st.session_state["rules_buf"]), file_name="Validation Rules.xlsx", mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet")
         else:
             st.info("Validation Rules file not available for download.")
     with cols[1]:
@@ -775,3 +812,8 @@ if st.session_state.get("detailed_df_preview") is not None:
             st.info("Validation Report file not available for download yet")
 
 # EOF
+'''
+out_path = Path("/mnt/data/29octapp.py")
+out_path.write_text(content)
+out_path
+
